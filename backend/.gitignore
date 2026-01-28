@@ -1,0 +1,53 @@
+# --- Python ---
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.so
+*.egg-info/
+.eggs/
+dist/
+build/
+
+# --- Virtual Environments ---
+.venv/
+venv/
+ENV/
+env/
+*.env
+myenv
+# --- Jupyter / Notebooks ---
+.ipynb_checkpoints/
+
+# --- IDE & Editor ---
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# --- OS files ---
+.DS_Store
+Thumbs.db
+
+# --- Project specific ---
+# Sensitive keys
+.env
+*.key
+*.pem
+
+# Data outputs
+FIR_REPORT.json
+output/
+logs/
+
+# PDFs
+data/*.pdf
+processed/
+data/
+
+# Cache
+.cache/
+generated_reports/
+testing/
+testing.py
+metformin_data.csv
