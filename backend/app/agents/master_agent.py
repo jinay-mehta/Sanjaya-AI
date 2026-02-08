@@ -1,0 +1,240 @@
+from langgraph.graph import StateGraph, END
+from pydantic import BaseModel
+import json
+from app.utils.schemas import RouterOutput, SynthOutput
+from app.utils.prompts import MASTER_AGENT_ROUTER_PROMPT, SYNTH_PROMPT
+from app.agents import (
+    iqvia_agent, patents_agent,exim_agent,
+    clinical_agent, internal_agent, web_agent,
+    report_agent
+)
+from app.config.settings import settings
+from openai import OpenAI
+
+
+client = OpenAI(
+    api_key=settings.GOOGLE_API_KEY or "not-set",
+    base_url="https://generativelanguage.googleapis.com/v1beta/openai/"
+)
+
+
+
+# MASTER STATE — only store simple top-level keys
+
+class MasterState(BaseModel):
+    selected_agents: list = []
+    routing_reason: str = ""
+    results: dict = {}  # safe when workers run sequentially
+
+
+
+# ROUTER NODE — selects agents
+
+async def router_node(state: MasterState, config):
+    user_query = config["configurable"]["user_query"]
+    schema = RouterOutput.model_json_schema()
+
+    completion = client.chat.completions.create(
+        model="gemini-2.5-flash",
+        messages=[
+            {"role": "system", "content": MASTER_AGENT_ROUTER_PROMPT},
+            {"role": "user", "content": user_query}
+        ],
+        response_format={
+            "type": "json_schema",
+            "json_schema": {"name": "RouterOutput", "schema": schema}
+        }
+    )
+
+    parsed = json.loads(completion.choices[0].message.content)
+    result = RouterOutput.model_validate(parsed)
+
+    state.selected_agents = result.selected_agents
+    state.routing_reason = result.reason
+    return state
+
+
+
+# WORKER EXECUTION NODE — sequential execution (NO MERGE PROBLEMS)
+
+worker_map = {
+    "IQVIA Insights Agent": ("IQVIA", iqvia_agent),
+    "Patent Landscape Agent": ("PATENTS", patents_agent),
+    "Clinical Trials Agent": ("CLINICAL", clinical_agent),
+    "EXIM Trends Agent": ("EXIM", exim_agent),
+    "Internal Knowledge Agent": ("INTERNAL", internal_agent),
+    "Web Intelligence Agent": ("WEB", web_agent),
+}
+
+async def run_workers_node(state: MasterState, config):
+    user_query = config["configurable"]["user_query"]
+
+    for agent_name in state.selected_agents:
+        if agent_name == "Report Generator Agent":
+            continue
+        if agent_name not in worker_map:
+            print(f"Unknown agent '{agent_name}' requested, skipping.")
+            continue
+        key, agent = worker_map[agent_name]
+        print(agent_name, "CALLED")
+        try:
+            output = await agent.run(user_query)
+            state.results[key] = output
+        except Exception as e:
+            print(f"Error running agent {agent_name}: {e}")
+            state.results[key] = {"agent": agent_name, "error": str(e)}
+
+    return state
+
+
+# SYNTH NODE
+async def synth_node(state: MasterState, config):
+
+    user_query = config["configurable"]["user_query"]
+    schema = SynthOutput.model_json_schema()
+
+    completion = client.chat.completions.create(
+        model="gemini-2.5-flash",
+        messages=[
+            {"role": "system", "content": SYNTH_PROMPT},
+            {"role": "user", "content": f"User query:\n{user_query}\n\nAgent outputs:\n{state.results}"}
+        ],
+        response_format={
+            "type": "json_schema",
+            "json_schema": {"name": "SynthOutput", "schema": schema}
+        }
+    )
+
+    parsed = json.loads(completion.choices[0].message.content)
+    result = SynthOutput.model_validate(parsed)
+
+    state.results["SYNTHESIZED"] = {
+        "summary": result.final_summary,
+        "recommendations": result.recommendations,
+        "tables": [t.model_dump() for t in result.tables],
+        "charts": [c.model_dump() for c in result.charts]
+    }
+
+    return state
+
+
+# REPORT NODE
+async def report_node(state: MasterState, config):
+    user_query = config["configurable"]["user_query"]
+    ctx = state.results["SYNTHESIZED"]
+
+    print("Generating final report...")
+
+    pdf = await report_agent.run(user_query, ctx)
+    state.results["REPORT"] = pdf
+    return state
+
+
+# BUILD GRAPH (SEQUENTIAL — SAFE)
+
+graph = StateGraph(MasterState)
+
+graph.add_node("router", router_node)
+graph.add_node("run_workers", run_workers_node)
+graph.add_node("synth", synth_node)
+graph.add_node("report", report_node)
+
+graph.set_entry_point("router")
+
+graph.add_edge("router", "run_workers")
+graph.add_edge("run_workers", "synth")
+graph.add_edge("synth", "report")
+graph.add_edge("report", END)
+
+master_chain = graph.compile()
+
+
+
+
+# Add this NEW function for streaming
+async def run_master_agent_streaming(query: str):
+    """Stream events as the agent progresses"""
+    
+    state = MasterState()
+    
+    # Step 1: Run router and emit selected agents immediately
+    state = await router_node(state, config={"configurable": {"user_query": query}})
+    
+    yield {
+        "type": "agents_selected",
+        "selected_agents": state.selected_agents,
+        "routing_reason": state.routing_reason
+    }
+    
+    # Step 2: Run workers and emit each result as it completes
+    user_query = query
+    for agent_name in state.selected_agents:
+        if agent_name == "Report Generator Agent":
+            continue
+        if agent_name not in worker_map:
+            print(f"Unknown agent '{agent_name}' in streaming loop, skipping.")
+            continue
+
+        key, agent = worker_map[agent_name]
+        
+        yield {
+            "type": "agent_started",
+            "agent_name": agent_name,
+            "agent_key": key
+        }
+        
+        try:
+            output = await agent.run(user_query)
+            state.results[key] = output
+        except Exception as e:
+            print(f"Error streaming agent {agent_name}: {e}")
+            output = {"agent": agent_name, "error": str(e)}
+            state.results[key] = output
+        
+        yield {
+            "type": "agent_completed",
+            "agent_name": agent_name,
+            "agent_key": key,
+            "result": output
+        }
+    
+    # Step 3: Run synthesis
+    yield {
+        "type": "synthesis_started"
+    }
+    
+    state = await synth_node(state, config={"configurable": {"user_query": query}})
+    
+    yield {
+        "type": "synthesis_completed",
+        "synthesized": state.results["SYNTHESIZED"]
+    }
+    
+    # Step 4: Generate report
+    yield {
+        "type": "report_started"
+    }
+    
+    state = await report_node(state, config={"configurable": {"user_query": query}})
+    
+    yield {
+        "type": "report_completed",
+        "report": state.results["REPORT"]
+    }
+    
+    # Final event
+    yield {
+        "type": "completed",
+        "results": state.results
+    }
+
+
+# Keep your original function for non-streaming use
+async def run_master_agent(query: str):
+    state = MasterState()
+    final = await master_chain.ainvoke(
+        state,
+        config={"configurable": {"user_query": query}}
+    )
+    return final, state.selected_agents
+
